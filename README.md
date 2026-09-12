@@ -23,6 +23,7 @@ docs, one topic each:
 | [`LED-SPI.md`](LED-SPI.md) | how the led matrix is really driven (spidev0.0 + a gpio latch, 3072-byte frames), how to take it over, and the native 60 fps renderer in `led/` |
 | [`RUNTIME.md`](RUNTIME.md) | the custom runtime in `runtime/` that replaces the stock app while it runs: how it hooks the boot chain, the supervisor / renderer / network daemon split, scenes and controls, its own authenticated http and mqtt api, what has been measured and what is still missing |
 | [`CANVAS.md`](CANVAS.md) | canvas mode, in pictures: every font, numeral, icon and drawing primitive the runtime offers, and the animations as recordings — each one a photograph of the panel rather than a drawing of it |
+| [`FIRMWARE.md`](FIRMWARE.md) | the `update.img` container (decoded, no signature), the vendor flasher and what it checks, `zkdaemon`'s boot check and reset key, the loader's order of operations, and the changes the runtime needs before it can be flashed persistently: yielding to upgrades, dhcp at cold boot, a telnet/ssh shell, recovery routes, the planned dockerfile and a first-flash rehearsal |
 | [`SECURITY.md`](SECURITY.md) | every security observation in one place, with mitigations |
 
 tools:
@@ -33,6 +34,7 @@ tools:
 | [`panel/`](panel/) | an english web control panel for the device (the stock ui is chinese-only) |
 | [`mqtt-check.py`](mqtt-check.py) | verify mosquitto broker credentials from the raw mqtt connack code |
 | [`tc002-ntp-patch.py`](tc002-ntp-patch.py) | make the clock sync every n minutes instead of every 2 h, and/or from your own ntp server — patches the app library in tmpfs, nothing in flash |
+| [`tc002-update-img.py`](tc002-update-img.py) | inspect, unpack and build the device's `update.img` (the `res` partition squashfs in the vendor's `ZKSWEV1.0` container): `inspect` runs the same checks the flasher does, `pack` rebuilds the vendor image byte for byte. see [`FIRMWARE.md`](FIRMWARE.md) |
 | [`led/`](led/) | popsquares generative art running on the device at 60 fps, straight to the panel over spi — static armv7 binary built with zig, plus an adb start/stop wrapper |
 | [`led-zig/`](led-zig/) | full-parity idiomatic zig renderer with typed modules, colocated tests, native dry-run, static armv7 build, and adb wrapper |
 | [`runtime/`](runtime/) | the custom runtime: a supervisor, a renderer (popsquares, plasma, clock, ip, notifications, raw frames, buttons and knob) and an unprivileged network daemon with a bearer-authenticated `/api/v1` and an mqtt client with home-assistant discovery, plus the bootstrap the vendor loader runs and a memory-audit tool. zig 0.16, static armv7, no libc, volatile under `/tmp`. reference in [`RUNTIME.md`](RUNTIME.md) |
@@ -364,6 +366,13 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwo
   (everything under `/tmp`, stock after a power cycle) and measured on a warm
   system; there is no persistent install, no tls and no sntp yet. see
   [`RUNTIME.md`](RUNTIME.md#what-is-not-there-yet).
+- the path to a persistent install is mapped: the `update.img` format is
+  decoded and reproduced by [`tc002-update-img.py`](tc002-update-img.py), the
+  flasher writes the `res` partition from linux with no signature check, and
+  the two things that block flashing the runtime today (the bootstrap defeats
+  the vendor's recovery, and dhcp lives in the loader it replaces) are
+  documented with their fixes in [`FIRMWARE.md`](FIRMWARE.md). **no custom
+  image has been flashed yet.**
 
 ## disclaimer
 
