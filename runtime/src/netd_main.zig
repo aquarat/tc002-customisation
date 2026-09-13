@@ -100,7 +100,11 @@ const Conn = struct {
     }
 };
 
-const MqttPending = struct { used: bool = false, id: u64 = 0, since_ns: u64 = 0 };
+/// `id` is the unique id netd relays under (the renderer deduplicates by request id, so a client
+/// that reuses one — an ha switch whose payloads are static strings, say — would have every second
+/// press replayed from the dedup cache and never applied). `client_id` is what the client sent, and
+/// is what the published result carries so correlation still works.
+const MqttPending = struct { used: bool = false, id: u64 = 0, client_id: u64 = 0, since_ns: u64 = 0 };
 
 /// a bounded text builder for json responses; overflow is remembered, never written past the end.
 const Out = struct {
@@ -543,7 +547,7 @@ const Netd = struct {
         };
         for (&self.m_pending) |*p| if (p.used and p.id == request_id) {
             p.used = false;
-            self.publishResult(request_id, r.status, r.revision);
+            self.publishResult(p.client_id, r.status, r.revision); // report the client's id, not ours
             return;
         };
     }
@@ -649,6 +653,14 @@ const Netd = struct {
                 self.flushConn(c, now);
             }
         }
+        // republish the settings document so the writable admin entities follow, and answer an
+        // mqtt-originated patch (the supervisor reports a config, not a result, when it applies one)
+        self.publishConfigDoc();
+        for (&self.m_pending) |*p| if (p.used and p.id == request_id) {
+            p.used = false;
+            self.publishResult(p.client_id, .applied, cfg.revision);
+            break;
+        };
     }
 
     /// the generators' own parameters, as a view: one object per generator keyed by the names its
@@ -712,7 +724,15 @@ const Netd = struct {
     }
 
     fn onSaveResult(self: *Netd, request_id: u64, r: messages.SaveResult, now: u64) void {
-        const c = self.findConn(true, request_id) orelse return;
+        const c = self.findConn(true, request_id) orelse {
+            // an mqtt-originated config patch the supervisor refused: report it on the result topic
+            for (&self.m_pending) |*p| if (p.used and p.id == request_id) {
+                p.used = false;
+                self.publishResult(p.client_id, r.status, r.saved_revision);
+                break;
+            };
+            return;
+        };
         switch (r.status) {
             .applied => {
                 var o = Out{ .buf = &json_buf };
@@ -1273,6 +1293,7 @@ const Netd = struct {
                 self.setError("");
                 self.mqttFlush();
                 self.mqttPublish("availability", "online", 1, true);
+                self.publishConfigDoc(); // the writable admin entities read their state from this
                 self.state_dirty = true;
                 self.last_state_pub_ns = 0;
                 if (self.cfg.discovery) self.discoveryStart(false, now);
@@ -1362,11 +1383,14 @@ const Netd = struct {
             self.publishResult(request_id, .overload, self.status.revision);
             return;
         };
-        if (!self.sendSupervisor(msg, request_id, epoch)) {
+        // relay under an id of our own so a client that reuses a request id is not silently served
+        // from the renderer's dedup cache; the client's id still identifies the published result.
+        const relay_id = self.newId();
+        if (!self.sendSupervisor(msg, relay_id, epoch)) {
             self.publishResult(request_id, .unavailable, self.status.revision);
             return;
         }
-        p.* = .{ .used = true, .id = request_id, .since_ns = now };
+        p.* = .{ .used = true, .id = relay_id, .client_id = request_id, .since_ns = now };
         self.mqtt_commands += 1;
     }
 
@@ -1432,12 +1456,21 @@ const Netd = struct {
                 .input => |i| self.mqttRelay(.{ .inject_input = .{ .control = @intFromEnum(i.control), .event = @intFromEnum(i.event), .steps = i.steps } }, i.request_id, i.epoch, now),
                 .notify => |n| self.mqttRelay(.{ .notify = messages.Notify.init(n.text, n.colour, n.duration_s, messages.Transition.fromSpec(n.transition)) }, n.request_id, n.epoch, now),
                 .config_patch => |cp| {
-                    // the control subset only: transient brightness and scene parameters
-                    const admin_fields = cp.timezone != null or cp.ntp_server != null or cp.ntp_interval_s != null or cp.frame_timeout_ms != null or cp.metrics_interval_s != null or cp.discovery != null or cp.discovery_prefix != null or cp.clock_font != null or cp.clock_colour_mode != null or cp.clock_colour != null or cp.clock_colour2 != null or cp.clock_gradient != null or cp.clock_spread != null or cp.ip_mode != null;
+                    // durable ("admin") settings are writable over mqtt too, so home assistant can
+                    // own them: any admin field makes this a real config patch, which the supervisor
+                    // validates, applies live and persists exactly as the http PATCH does. the
+                    // broker is the only gate on that, which is why it is documented as a trust
+                    // decision. a patch of only control fields stays transient, so a dragged
+                    // brightness slider does not write flash on every step.
+                    const admin_fields = cp.timezone != null or cp.ntp_server != null or cp.ntp_interval_s != null or cp.frame_timeout_ms != null or cp.metrics_interval_s != null or cp.discovery != null or cp.discovery_prefix != null or cp.clock_font != null or cp.clock_colour_mode != null or cp.clock_colour != null or cp.clock_colour2 != null or cp.clock_gradient != null or cp.clock_spread != null or cp.clock_digit != null or cp.ip_mode != null or cp.night != null or cp.night_brightness != null or cp.night_lead_min != null or cp.location != null or cp.location_auto != null;
                     if (admin_fields) {
-                        var o = Out{ .buf = &json_buf };
-                        o.add("{\"status\":\"rejected\",\"error\":\"admin_only\",\"message\":\"durable settings are administered over http\"}");
-                        self.mqttPublish("result", o.slice(), 0, false);
+                        const w = messages.ConfigPatch.fromApi(cp) catch {
+                            var o = Out{ .buf = &json_buf };
+                            o.add("{\"status\":\"rejected\",\"error\":\"too_long\",\"message\":\"a text field in the patch is too long\"}");
+                            self.mqttPublish("result", o.slice(), 0, false);
+                            return;
+                        };
+                        self.mqttRelay(.{ .config_patch = w }, self.newId(), 0, now);
                         return;
                     }
                     const rid = self.newId();
@@ -1520,6 +1553,25 @@ const Netd = struct {
         .{ .key = "scene", .name = "scene", .component = .select, .topic = "state", .template = "{{ value_json.scene }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"base\\\": value} | to_json }}", .options = "\"clock\",\"art\",\"ip\"" },
         .{ .key = "brightness", .name = "brightness", .component = .number, .topic = "state", .template = "{{ value_json.brightness }}", .unit = "%", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"brightness\\\": value | int} | to_json }}", .min = 0, .max = 100 },
         .{ .key = "notify", .name = "notification", .component = .text, .diagnostic = false, .command = "cmd/notify", .command_template = "{{ {\\\"text\\\": value, \\\"request_id\\\": \\\"1\\\", \\\"epoch\\\": 0} | to_json }}" },
+        // durable ("admin") settings, writable: each commands cmd/config with one flat patch field
+        // and reads its current value from the retained `config` document. the supervisor validates,
+        // applies live and persists them, so a change from ha survives a reboot.
+        .{ .key = "clock_font", .name = "clock font", .component = .select, .topic = "config", .template = "{{ value_json.clock.font }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_font\\\": value} | to_json }}", .options = "\"classic\",\"mini\",\"segment\",\"big\",\"block\",\"hires\"" },
+        .{ .key = "clock_colour_mode", .name = "clock colour mode", .component = .select, .topic = "config", .template = "{{ value_json.clock.colour_mode }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_colour_mode\\\": value} | to_json }}", .options = "\"solid\",\"gradient\"" },
+        .{ .key = "clock_colour", .name = "clock colour", .component = .text, .topic = "config", .template = "{{ value_json.clock.colour }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_colour\\\": value} | to_json }}" },
+        .{ .key = "clock_colour2", .name = "clock second colour", .component = .text, .topic = "config", .template = "{{ value_json.clock.colour2 }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_colour2\\\": value} | to_json }}" },
+        .{ .key = "clock_gradient", .name = "clock gradient", .component = .select, .topic = "config", .template = "{{ value_json.clock.gradient }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_gradient\\\": value} | to_json }}", .options = "\"horizontal\",\"vertical\",\"diagonal\"" },
+        .{ .key = "clock_digit", .name = "clock digit style", .component = .select, .topic = "config", .template = "{{ value_json.clock.digits }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_digit\\\": value} | to_json }}", .options = "\"solid\",\"outline\",\"shadow\"" },
+        .{ .key = "clock_spread", .name = "clock gradient spread", .component = .number, .topic = "config", .template = "{{ value_json.clock.spread }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"clock_spread\\\": value | int} | to_json }}", .min = 0, .max = 255 },
+        .{ .key = "ip_mode", .name = "ip layout", .component = .select, .topic = "config", .template = "{{ value_json.ip_mode }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"ip_mode\\\": value} | to_json }}", .options = "\"lines\",\"mini\",\"scroll\",\"big\"" },
+        .{ .key = "generator", .name = "art generator", .component = .select, .topic = "config", .template = "{{ value_json.generator }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"generator\\\": value} | to_json }}", .options = "\"popsquares\",\"plasma\",\"cube\"" },
+        .{ .key = "timezone", .name = "timezone", .component = .text, .topic = "config", .template = "{{ value_json.timezone }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"timezone\\\": value} | to_json }}" },
+        .{ .key = "ntp_server", .name = "ntp server", .component = .text, .topic = "config", .template = "{{ value_json.ntp.server if value_json.ntp.server else '' }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"ntp_server\\\": value} | to_json }}" },
+        .{ .key = "ntp_interval", .name = "ntp interval", .component = .select, .topic = "config", .template = "{{ value_json.ntp.interval_s }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"ntp_interval_s\\\": value | int} | to_json }}", .options = "\"300\",\"600\"" },
+        .{ .key = "night", .name = "night dimming", .component = .@"switch", .topic = "config", .template = "{{ 'ON' if value_json.night.enabled else 'OFF' }}", .diagnostic = false, .command = "cmd/config", .payload_on = "{\\\"night\\\":true}", .payload_off = "{\\\"night\\\":false}" },
+        .{ .key = "night_brightness", .name = "night brightness", .component = .number, .topic = "config", .template = "{{ value_json.night.brightness }}", .unit = "%", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"night_brightness\\\": value | int} | to_json }}", .min = 0, .max = 100 },
+        .{ .key = "night_lead", .name = "night lead", .component = .number, .topic = "config", .template = "{{ value_json.night.lead_min }}", .unit = "min", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"night_lead_min\\\": value | int} | to_json }}", .min = 0, .max = 120 },
+        .{ .key = "metrics_interval", .name = "metrics interval", .component = .number, .topic = "config", .template = "{{ value_json.metrics_interval_s }}", .unit = "s", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"metrics_interval_s\\\": value | int} | to_json }}", .min = 0, .max = 3600 },
         .{ .key = "button_left", .name = "left button", .component = .event, .topic = "input/left", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
         .{ .key = "button_middle", .name = "middle button", .component = .event, .topic = "input/middle", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
         .{ .key = "button_right", .name = "right button", .component = .event, .topic = "input/right", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
@@ -1620,7 +1672,9 @@ const Netd = struct {
             var id: [24]u8 = undefined;
             const dev = self.deviceId(&id);
             o.fmt("{{\"name\":\"{s}\",\"unique_id\":\"{s}_{s}\",\"availability_topic\":\"{s}/availability\"", .{ e.name, dev, e.key, self.prefix() });
-            if (e.component != .text) o.fmt(",\"state_topic\":\"{s}/{s}\"", .{ self.prefix(), e.topic }); // text is command-only here
+            // everything with a template has a state to read; a text entity without one (the
+            // notification box) is command-only and must not advertise a state topic.
+            if (e.component != .text or e.template.len > 0) o.fmt(",\"state_topic\":\"{s}/{s}\"", .{ self.prefix(), e.topic });
             if (e.command.len > 0) o.fmt(",\"command_topic\":\"{s}/{s}\"", .{ self.prefix(), e.command });
             switch (e.component) {
                 .sensor => o.fmt(",\"value_template\":\"{s}\",\"expire_after\":{d}", .{ e.template, interval * 3 }),
@@ -1629,7 +1683,10 @@ const Netd = struct {
                 .@"switch" => o.fmt(",\"value_template\":\"{s}\",\"state_on\":\"ON\",\"state_off\":\"OFF\",\"payload_on\":\"{s}\",\"payload_off\":\"{s}\"", .{ e.template, e.payload_on, e.payload_off }),
                 .select => o.fmt(",\"value_template\":\"{s}\",\"command_template\":\"{s}\",\"options\":[{s}]", .{ e.template, e.command_template, e.options }),
                 .number => o.fmt(",\"value_template\":\"{s}\",\"command_template\":\"{s}\",\"min\":{d},\"max\":{d},\"mode\":\"slider\"", .{ e.template, e.command_template, e.min, e.max }),
-                .text => o.fmt(",\"command_template\":\"{s}\"", .{e.command_template}),
+                .text => {
+                    if (e.template.len > 0) o.fmt(",\"value_template\":\"{s}\"", .{e.template});
+                    o.fmt(",\"command_template\":\"{s}\"", .{e.command_template});
+                },
             }
             if (e.diagnostic) o.add(",\"entity_category\":\"diagnostic\"");
             if (e.unit.len > 0) o.fmt(",\"unit_of_measurement\":\"{s}\"", .{e.unit});
@@ -1640,6 +1697,15 @@ const Netd = struct {
         }
         self.disc_index += 1;
         self.disc_next_ns = now + ns_per_s;
+    }
+
+    /// the durable settings as a retained document, so the writable "admin" ha entities have a
+    /// state to read. published on connect and whenever the supervisor reports a changed config.
+    fn publishConfigDoc(self: *Netd) void {
+        if (!self.m_connected or !self.have_cfg) return;
+        var o = Out{ .buf = json_buf[0..4096] };
+        self.configJson(&o);
+        if (!o.overflow) self.mqttPublish("config", o.slice(), 0, true) else self.mqtt_dropped += 1;
     }
 
     fn mqttPublishTopic(self: *Netd, t: []const u8, payload: []const u8, qos: u2, retain: bool) void {

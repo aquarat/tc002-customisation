@@ -1253,15 +1253,29 @@ random per-boot id. the set:
   total, flash used and total and as a percentage, battery and usb power,
   renderer restarts, mqtt reconnects, night schedule, fps, frames presented,
   time sync state);
-- **controllable (read + write) entities** for the mqtt control subset: a
-  `switch` for display power, a `select` for the scene (clock/art/ip), a
-  `number` for brightness (0–100), and a `text` for a notification message.
-  scene and brightness command through `cmd/config` (which mints its own request
-  id and uses epoch 0, so ha needs neither); power and notify command through
-  `cmd/action` and `cmd/notify` with a fixed request id and epoch 0. durable
-  admin settings (clock font, colours, timezone, ntp, ip mode) are **not**
-  writable over mqtt by design — they are administered over the authenticated
-  http api — so they do not appear as controllable entities;
+- **controllable (read + write) entities.** the transient controls: a `switch`
+  for display power, a `select` for the scene (clock/art/ip), a `number` for
+  brightness (0–100), and a `text` for a notification message. and the durable
+  ("admin") settings, which are writable over mqtt too: `select`s for the clock
+  font, colour mode, gradient and digit style, the ip layout, the art generator
+  and the ntp interval; `number`s for the gradient spread, night brightness,
+  night lead and metrics interval; a `switch` for night dimming; and `text`
+  boxes for the two clock colours, the timezone and the ntp server. the admin
+  entities read their current value from a retained `config` topic (the same
+  document `GET /config` returns) and command one flat patch field each through
+  `cmd/config`; the supervisor validates, applies live and persists them, so a
+  change made in ha survives a reboot. a patch of only control fields stays
+  transient, so a dragged brightness slider does not write flash per step.
+  **the broker is the only gate on the admin surface** — anyone who can publish
+  to it can rewrite durable settings, unlike the http api which needs the admin
+  bearer token. the meta settings stay off mqtt deliberately: the discovery
+  toggle and prefix, and the mqtt and ntfy configuration itself (configuring the
+  transport over the transport), are http-only;
+- netd relays every mqtt command under **an id of its own**, reporting the
+  client's id in the `result`. the renderer deduplicates discrete commands by
+  request id, so a client that reuses one — an ha `switch`, whose payloads are
+  fixed strings — would otherwise have every second press replayed from the
+  dedup cache and never applied;
 - one `binary_sensor`-equivalent state is folded into the power `switch`, and
   five `event` entities (left, middle and right buttons, the knob, the rotary)
   fed by the momentary `input/<control>` topics with `event_types` press/release
