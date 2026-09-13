@@ -1241,19 +1241,31 @@ the same block is in `GET /status`, so the console sees it too.
 
 opt-in with `discovery: true`. on every mqtt connection netd publishes one
 retained config per second under
-`<discovery_prefix>/<component>/tc002-<mac>/<key>/config` (the boot id stands
-in when there is no wlan0 mac): 43 read-only diagnostic `sensor` entities that
-read from the `metrics` topic (uptime, memory used and available and total and
-cached and dirty and slab, cpu
-overall and per process, load, wifi signal and quality and byte rates and totals
-and error and dropped counts, settings saves and failures and bytes written,
-tmpfs used and total, flash used and total
-and as a percentage, battery and usb power, renderer restarts, mqtt reconnects,
-scene, brightness, fps, frames presented, time sync state), one
-`binary_sensor` for display power that reads the retained `state` topic, and
-five `event` entities (left, middle and right buttons, the knob, the rotary)
-fed by the momentary `input/<control>` topics with `event_types` press/release
-(plus `long` for the knob, `cw`/`ccw` for the rotary). forty-nine entities at
+`<discovery_prefix>/<component>/tc002-<mac>/<key>/config`. the mac is the stable
+identity; on a cold boot the wifi driver is loaded a few seconds in, so the
+supervisor re-reads the mac once `wlan0` appears (`pollMac`) and netd
+re-publishes discovery if the identity changed, so it never settles on the
+random per-boot id. the set:
+- **read-only `sensor` entities** from the `metrics` topic (uptime, memory used
+  and available and total and cached and dirty and slab, cpu overall and per
+  process, load, wifi signal and quality and byte rates and totals and error and
+  dropped counts, settings saves and failures and bytes written, tmpfs used and
+  total, flash used and total and as a percentage, battery and usb power,
+  renderer restarts, mqtt reconnects, night schedule, fps, frames presented,
+  time sync state);
+- **controllable (read + write) entities** for the mqtt control subset: a
+  `switch` for display power, a `select` for the scene (clock/art/ip), a
+  `number` for brightness (0–100), and a `text` for a notification message.
+  scene and brightness command through `cmd/config` (which mints its own request
+  id and uses epoch 0, so ha needs neither); power and notify command through
+  `cmd/action` and `cmd/notify` with a fixed request id and epoch 0. durable
+  admin settings (clock font, colours, timezone, ntp, ip mode) are **not**
+  writable over mqtt by design — they are administered over the authenticated
+  http api — so they do not appear as controllable entities;
+- one `binary_sensor`-equivalent state is folded into the power `switch`, and
+  five `event` entities (left, middle and right buttons, the knob, the rotary)
+  fed by the momentary `input/<control>` topics with `event_types` press/release
+  (plus `long` for the knob, `cw`/`ccw` for the rotary). about fifty entities at
 one per second means a full pass takes about that many seconds. they are grouped into
 one device, linked to the `availability` topic, and the metrics sensors expire
 after three metrics intervals. a home-assistant birth message

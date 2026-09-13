@@ -1286,6 +1286,22 @@ const Supervisor = struct {
         return total;
     }
 
+    /// on a cold boot wlan0 does not exist yet when readMac runs at startup (netup loads the driver
+    /// a few seconds later), so the mac — the stable ha device identity — is missing and discovery
+    /// would fall back to the random per-boot id. re-read it each tick until it appears (the mac is
+    /// available as soon as the interface exists, before dhcp), then push it to netd so discovery
+    /// uses the mac. cheap and stops once found.
+    fn pollMac(self: *Supervisor, now: u64) void {
+        _ = now;
+        if (self.snapshot.mac_present != 0) return;
+        self.readMac();
+        if (self.snapshot.mac_present != 0) {
+            const m = self.snapshot.mac;
+            log.info("wlan0 mac now available: tc002-{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}", .{ m[0], m[1], m[2], m[3], m[4], m[5] });
+            self.sendNetd(.{ .status = self.snapshot }, 0);
+        }
+    }
+
     fn readMac(self: *Supervisor) void {
         var buf: [32]u8 = undefined;
         const text = sys.readFile("/sys/class/net/wlan0/address", &buf) catch return;
@@ -2091,6 +2107,7 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
         s.pollLifecycle(now);
         s.pollIp(now);
         s.pollNetwork(now);
+        s.pollMac(now);
         if (s.bootRecovery(now)) return 0;
         s.pushDeviceStatus(now);
         s.pollNight(now);

@@ -181,6 +181,10 @@ const Netd = struct {
     disc_next_ns: u64 = 0,
     disc_published: bool = false,
     disc_prefix_used: config.Text = .{},
+    /// the device id discovery was last published under, so a late mac (cold boot) that changes the
+    /// identity triggers a republish instead of leaving entities under the wrong (boot) id
+    disc_id_buf: [24]u8 = undefined,
+    disc_id_len: usize = 0,
     // counters
     http_requests: u32 = 0,
     http_rejected: u32 = 0,
@@ -607,6 +611,13 @@ const Netd = struct {
         self.status = st;
         self.status_at_ns = now;
         if (changed) self.state_dirty = true;
+        // a late mac (cold boot) changes the device identity after discovery was first published
+        // under the boot id; republish under the mac so ha does not keep a stale boot-id device.
+        if (self.disc_published and self.cfg.discovery) {
+            var id: [24]u8 = undefined;
+            const d = self.deviceId(&id);
+            if (!std.mem.eql(u8, d, self.disc_id_buf[0..self.disc_id_len])) self.discoveryStart(false, now);
+        }
         if (request_id != 0) {
             if (self.findConn(true, request_id)) |c| {
                 if (c.awaiting == .status) {
@@ -1474,7 +1485,8 @@ const Netd = struct {
     // home-assistant mqtt discovery: read-only diagnostic sensors over the metrics topic, the
     // display power over the state topic, and the physical controls as momentary event entities
 
-    const Component = enum { sensor, binary_sensor, event };
+    // `@"switch"` so @tagName yields the ha component name "switch"; the others are plain names.
+    const Component = enum { sensor, binary_sensor, event, @"switch", select, number, text };
     const Entity = struct {
         key: []const u8,
         name: []const u8,
@@ -1488,9 +1500,26 @@ const Netd = struct {
         /// json array body for an event entity's `event_types`
         event_types: []const u8 = "",
         diagnostic: bool = true,
+        // writable entities (switch/select/number/text): the cmd/ subtopic to publish to, and how
+        // to shape the payload. only the mqtt control subset is commandable; admin settings are not.
+        command: []const u8 = "", // e.g. "cmd/action"; when set, a command_topic is emitted
+        command_template: []const u8 = "", // ha command_template producing the device json payload
+        options: []const u8 = "", // select: json array of option strings
+        min: i32 = 0, // number: range; emitted when max > min
+        max: i32 = 0,
+        payload_on: []const u8 = "", // switch: the exact cmd payloads
+        payload_off: []const u8 = "",
     };
     const entities = [_]Entity{
-        .{ .key = "power", .name = "display power", .component = .binary_sensor, .topic = "state", .template = "{{ 'ON' if value_json.power else 'OFF' }}", .device_class = "power" },
+        // controllable entities (read + write), mapping to the mqtt control subset
+        // controllable entities (read + write). scene/brightness go through cmd/config (it mints
+        // its own request_id and uses epoch 0, so ha needs neither); power/notify go through their
+        // action/notify topics, which require request_id + epoch — a fixed request_id is fine (no
+        // dedup) and epoch 0 is accepted (the supervisor applies against the live renderer epoch).
+        .{ .key = "power", .name = "display power", .component = .@"switch", .topic = "state", .template = "{{ 'ON' if value_json.power else 'OFF' }}", .device_class = "outlet", .diagnostic = false, .command = "cmd/action", .payload_on = "{\\\"action\\\":\\\"power\\\",\\\"power\\\":true,\\\"request_id\\\":\\\"1\\\",\\\"epoch\\\":0}", .payload_off = "{\\\"action\\\":\\\"power\\\",\\\"power\\\":false,\\\"request_id\\\":\\\"1\\\",\\\"epoch\\\":0}" },
+        .{ .key = "scene", .name = "scene", .component = .select, .topic = "state", .template = "{{ value_json.scene }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"base\\\": value} | to_json }}", .options = "\"clock\",\"art\",\"ip\"" },
+        .{ .key = "brightness", .name = "brightness", .component = .number, .topic = "state", .template = "{{ value_json.brightness }}", .unit = "%", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"brightness\\\": value | int} | to_json }}", .min = 0, .max = 100 },
+        .{ .key = "notify", .name = "notification", .component = .text, .diagnostic = false, .command = "cmd/notify", .command_template = "{{ {\\\"text\\\": value, \\\"request_id\\\": \\\"1\\\", \\\"epoch\\\": 0} | to_json }}" },
         .{ .key = "button_left", .name = "left button", .component = .event, .topic = "input/left", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
         .{ .key = "button_middle", .name = "middle button", .component = .event, .topic = "input/middle", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
         .{ .key = "button_right", .name = "right button", .component = .event, .topic = "input/right", .event_types = "\"press\",\"release\"", .device_class = "button", .diagnostic = false },
@@ -1504,8 +1533,6 @@ const Netd = struct {
         .{ .key = "rss_netd", .name = "netd rss", .template = "{{ value_json.rss_kb.netd }}", .unit = "kB", .device_class = "data_size", .state_class = "measurement" },
         .{ .key = "renderer_restarts", .name = "renderer restarts", .template = "{{ value_json.renderer_restarts }}", .unit = "", .device_class = "", .state_class = "total" },
         .{ .key = "mqtt_reconnects", .name = "mqtt reconnects", .template = "{{ value_json.mqtt_reconnects }}", .unit = "", .device_class = "", .state_class = "total" },
-        .{ .key = "scene", .name = "scene", .template = "{{ value_json.scene }}", .unit = "", .device_class = "", .state_class = "" },
-        .{ .key = "brightness", .name = "brightness", .template = "{{ value_json.brightness }}", .unit = "%", .device_class = "", .state_class = "measurement" },
         .{ .key = "night", .name = "night schedule", .template = "{{ value_json.night }}", .unit = "", .device_class = "", .state_class = "" },
         .{ .key = "fps", .name = "achieved fps", .template = "{{ value_json.fps if value_json.fps is not none else 'unknown' }}", .unit = "fps", .device_class = "", .state_class = "measurement" },
         .{ .key = "presented", .name = "frames presented", .template = "{{ value_json.presented }}", .unit = "", .device_class = "", .state_class = "total_increasing" },
@@ -1558,7 +1585,13 @@ const Netd = struct {
     /// start a discovery pass: publish (or, when removing, clear) every entity, one per second.
     fn discoveryStart(self: *Netd, remove: bool, now: u64) void {
         if (!self.m_connected) return;
-        if (!remove) self.disc_prefix_used = self.cfg.discovery_prefix;
+        if (!remove) {
+            self.disc_prefix_used = self.cfg.discovery_prefix;
+            var id: [24]u8 = undefined;
+            const d = self.deviceId(&id);
+            @memcpy(self.disc_id_buf[0..d.len], d);
+            self.disc_id_len = d.len;
+        }
         self.disc_index = 0;
         self.disc_active = true;
         self.disc_remove = remove;
@@ -1586,11 +1619,17 @@ const Netd = struct {
             const interval: u64 = if (self.cfg.metrics_interval_s != 0) self.cfg.metrics_interval_s else 30;
             var id: [24]u8 = undefined;
             const dev = self.deviceId(&id);
-            o.fmt("{{\"name\":\"{s}\",\"unique_id\":\"{s}_{s}\",\"state_topic\":\"{s}/{s}\",\"availability_topic\":\"{s}/availability\"", .{ e.name, dev, e.key, self.prefix(), e.topic, self.prefix() });
+            o.fmt("{{\"name\":\"{s}\",\"unique_id\":\"{s}_{s}\",\"availability_topic\":\"{s}/availability\"", .{ e.name, dev, e.key, self.prefix() });
+            if (e.component != .text) o.fmt(",\"state_topic\":\"{s}/{s}\"", .{ self.prefix(), e.topic }); // text is command-only here
+            if (e.command.len > 0) o.fmt(",\"command_topic\":\"{s}/{s}\"", .{ self.prefix(), e.command });
             switch (e.component) {
                 .sensor => o.fmt(",\"value_template\":\"{s}\",\"expire_after\":{d}", .{ e.template, interval * 3 }),
                 .binary_sensor => o.fmt(",\"value_template\":\"{s}\",\"payload_on\":\"ON\",\"payload_off\":\"OFF\"", .{e.template}),
                 .event => o.fmt(",\"event_types\":[{s}]", .{e.event_types}),
+                .@"switch" => o.fmt(",\"value_template\":\"{s}\",\"state_on\":\"ON\",\"state_off\":\"OFF\",\"payload_on\":\"{s}\",\"payload_off\":\"{s}\"", .{ e.template, e.payload_on, e.payload_off }),
+                .select => o.fmt(",\"value_template\":\"{s}\",\"command_template\":\"{s}\",\"options\":[{s}]", .{ e.template, e.command_template, e.options }),
+                .number => o.fmt(",\"value_template\":\"{s}\",\"command_template\":\"{s}\",\"min\":{d},\"max\":{d},\"mode\":\"slider\"", .{ e.template, e.command_template, e.min, e.max }),
+                .text => o.fmt(",\"command_template\":\"{s}\"", .{e.command_template}),
             }
             if (e.diagnostic) o.add(",\"entity_category\":\"diagnostic\"");
             if (e.unit.len > 0) o.fmt(",\"unit_of_measurement\":\"{s}\"", .{e.unit});
