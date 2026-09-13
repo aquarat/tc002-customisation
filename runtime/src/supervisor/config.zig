@@ -11,6 +11,7 @@ const ip = @import("../scene/ip.zig");
 const ntfy_url = @import("../ntfy/url.zig");
 const tz = @import("../scene/tz.zig");
 const solar = @import("../sys/solar.zig");
+const arbiter = @import("../scene/arbiter.zig");
 const night = @import("night.zig");
 
 pub const text_max = 64;
@@ -437,7 +438,7 @@ const FileForm = struct {
     revision: u32 = 0,
     brightness: u8 = 100,
     base: []const u8 = base_names[base_clock],
-    generator: []const u8 = "popsquares",
+    generator: []const u8 = @tagName(scene.Generator.popsquares),
     timezone: []const u8 = "UTC0",
     ntp_server: ?[]const u8 = null,
     ntp_interval_s: u32 = 300,
@@ -482,11 +483,28 @@ const FileForm = struct {
     } = .{},
 };
 
-const base_names = [_][]const u8{ "clock", "art", "canvas" };
+/// the names in the settings file come straight from the enums the rest of the runtime uses, so a
+/// scene or a generator added there cannot be left out here. a hand-written list was: `cube` was
+/// added to `scene.Generator` and not to this table, so saving clamped it to the last name it knew
+/// and every `cube` came back from the file as `plasma`.
+const base_names = enumNames(arbiter.Base);
+const generator_names = enumNames(scene.Generator);
+
+fn enumNames(comptime E: type) [@typeInfo(E).@"enum".fields.len][]const u8 {
+    const fields = @typeInfo(E).@"enum".fields;
+    var out: [fields.len][]const u8 = undefined;
+    for (fields, 0..) |f, i| {
+        // the enum values are the indexes the file names are looked up by, so anything else would
+        // silently write the wrong name
+        std.debug.assert(f.value == i);
+        out[i] = f.name;
+    }
+    return out;
+}
+
 /// the base scene of a device with no settings file: a power cycle wipes /tmp, and the first
 /// frame after a cold start must be the clock rather than a flash of the art generator.
-const base_clock: u8 = 0;
-const generator_names = [_][]const u8{ "popsquares", "plasma" };
+const base_clock: u8 = @intFromEnum(arbiter.Base.clock);
 
 fn nameIndex(names: []const []const u8, name: []const u8) ?u8 {
     for (names, 0..) |n, i| if (std.mem.eql(u8, n, name)) return @intCast(i);
@@ -769,6 +787,26 @@ test "a cold start with no settings file shows the clock, never art" {
     var arena: [4096]u8 = undefined;
     const back = try fromJson("{\"schema\":1}", &arena);
     try std.testing.expectEqualStrings("clock", base_names[back.base]);
+}
+
+test "every base and generator survives the settings file" {
+    // `cube` was added to scene.Generator and left out of this file's hand-written name table, so
+    // saving clamped it to the last name the table had and it came back as `plasma`: a generator
+    // chosen over mqtt or the api applied live and was then lost on the next boot. the tables are
+    // derived from the enums now, and this walks every value through the file to prove it.
+    var out: [file_max]u8 = undefined;
+    var arena: [file_max]u8 = undefined;
+    for (0..base_names.len) |b| {
+        for (0..generator_names.len) |g| {
+            var c = Config{ .base = @intCast(b), .generator = @intCast(g) };
+            const back = try fromJson(try toJson(&c, &out), &arena);
+            try std.testing.expectEqual(c.base, back.base);
+            try std.testing.expectEqual(c.generator, back.generator);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, scene.generator_count), generator_names.len);
+    try std.testing.expectEqualStrings("cube", generator_names[@intFromEnum(scene.Generator.cube)]);
+    try std.testing.expectEqualStrings("canvas", base_names[@intFromEnum(arbiter.Base.canvas)]);
 }
 
 test "origin policy is derived from the config" {

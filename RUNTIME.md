@@ -159,7 +159,14 @@ exercised on the device (nobody has pressed the knob during a run).
   `saved_revision` follows on its own and a client confirms persistence by
   seeing the two match in the reply; `POST /config/save` remains and forces a
   write. a patch can name the revision it expects and is refused with
-  `conflict` if it is stale. the model is in [settings](#settings).
+  `conflict` if it is stale. the model is in [settings](#settings). the enum
+  fields are stored **by name**, and those names are derived from the enums the
+  rest of the runtime uses rather than written out again: a hand-kept list in
+  the persistence layer had fallen a value behind (`cube` was added to
+  `scene.Generator` and not to it), and saving clamped the unknown value to the
+  last name the list had — so `cube` applied live, was written to flash as
+  `plasma`, and came back wrong on the next boot. a test walks every base and
+  every generator through the file to keep the two from drifting again.
 - **the listener**: port 80 is bound by root with `SO_REUSEADDR`, then netd
   is forked with exactly two inherited descriptors (fd 3 the channel, fd 5 the
   listener), privileges dropped to uid/gid 1001 with no supplementary groups
@@ -1166,8 +1173,17 @@ literal (there is no resolver). keepalive is 30 s, a missed ping response
 within 15 s drops the connection, and reconnects back off from 1 s to 60 s
 with jitter. `tls: true` is accepted as a setting and makes the client **stay
 disconnected** with `last_error: tls is not available in this build`; it
-never falls back to plaintext silently. the client id defaults to
-`tc002-<boot_id>`. all topics live under `prefix` (default `tc002`):
+never falls back to plaintext silently. the client id defaults to the **stable
+device identity** (`tc002-<mac>`, the same id discovery groups the entities
+under), not to anything per-boot: a client id that changed on every boot left
+the previous session alive on the broker until its keepalive expired, and that
+dead session's retained will (`offline`) then landed *after* the new session had
+published `online` — which left every home-assistant entity unavailable after a
+reboot. netd also subscribes to its own `availability` topic and republishes
+`online` if it ever reads a retained `offline` while connected, which heals the
+same race from a broker restart replaying wills (it fires, and is logged, at
+about 10 ms after each connect). all topics live under `prefix` (default
+`tc002`):
 
 | topic | direction | payload |
 |-------|-----------|---------|
@@ -1177,7 +1193,7 @@ never falls back to plaintext silently. the client id defaults to
 | `metrics` | out, every `metrics_interval_s` | the [metrics document](#the-metrics-document) |
 | `cmd/scene`, `cmd/action`, `cmd/notify` | in, qos 1 | exactly the http json bodies |
 | `cmd/frame` | in, qos 1 | binary, 2,510 bytes big-endian: `u64 request_id`, `u32 epoch`, `u16 duration_s`, 2,496 rgb bytes; or 2,514 / 2,515 bytes with `u8 effect`, `u8 direction`, `u16 duration_ms` and optionally `u8 exit` before the rgb (see [transitions](#transitions)) |
-| `cmd/config` | in, qos 1 | the control subset only: `brightness`, `base`, `generator` (transient, like `/action` and `/scene`). any durable field is answered `admin_only`; those are administered over http |
+| `cmd/config` | in, qos 1 | a config patch. `brightness` alone stays transient, so a dragged slider does not write flash on every step; every other field — the scene `base` and the art `generator` included — is a durable patch, validated, applied live and persisted exactly as the http `PATCH` does. `base` has to be durable: the supervisor re-sends `set_base` from the *stored* base whenever the base or the generator changes, so a transient base snapped the scene back (and dropped the generator with it) on the next settings change |
 | `cmd/input` | in, qos 1 | the `/input` json body; answered on `result` |
 | `cmd/screen` | in, qos 1 | any payload; answered on `screen` |
 | `screen` | out, not retained | binary, 2,502 bytes: `u32 revision, u8 brightness, u8 power`, then the 2,496 rgb bytes as shown |
@@ -1285,8 +1301,18 @@ one device, linked to the `availability` topic, and the metrics sensors expire
 after three metrics intervals. a home-assistant birth message
 (`<discovery_prefix>/status` = `online`) repeats the pass; turning discovery
 off, or changing the prefix, clears exactly those topics with empty retained
-publishes. nothing writable is exposed through discovery; control goes through
-`cmd/*`.
+publishes. the writable entities carry a `command_topic` under `cmd/*`, so home
+assistant drives the device through the same surface a script would.
+
+the scene `select` offers exactly the three base scenes — `clock`, `art`,
+`canvas` — because that is what `arbiter.Base` has; there is no `ip` scene (the
+durable `ip_mode` setting only chooses how the *address overlay* is laid out).
+it reads its state from `state` as `{{ value_json.base }}`: the status document
+calls that field `base`, and a template naming a `scene` field resolved to
+nothing, which showed in home assistant as the entity snapping to `unknown` a
+couple of seconds after every change. the art `generator` select reads from the
+retained `config` topic instead, because the renderer only reports a live
+generator while the art base is actually up.
 
 ## host tools (`runtime/tools/`)
 

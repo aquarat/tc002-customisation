@@ -82,14 +82,18 @@ tools/tc002ctl.py -s <device-ip> --token-file tokens config-set discovery=true m
 tools/tc002-test-broker.py                              # a minimal broker on the host, for tests
 ```
 
-mqtt topics under the configured prefix: `availability` (retained, last will `offline`), `state`
+mqtt topics under the configured prefix: `availability` (retained, last will `offline`; the client id
+is the stable `tc002-<mac>` so a reboot's dead session cannot overwrite `online` with its late will,
+and netd heals a stale `offline` it reads back anyway), `state`
 (retained, at most twice per second), `config` (retained, the durable settings document, republished
 whenever they change), `result` (one per command, with the request id), `metrics`
 (every 30 s by default), `screen` (a binary frame, in answer to `cmd/screen`), `input/<control>`
 (momentary button, knob and rotary events, never retained), and `cmd/scene`, `cmd/action`,
 `cmd/notify`, `cmd/frame`, `cmd/input`, `cmd/screen`, `cmd/config`. `cmd/config` takes the transient
 control fields *and* the durable settings, which it applies and persists like the http PATCH does —
-so the broker is the only gate on them, a deliberate trust decision.
+so the broker is the only gate on them, a deliberate trust decision. only `brightness` on its own
+stays transient; the scene and the art generator are persisted, because the supervisor re-derives
+`set_base` from the *stored* base and a transient one snapped the scene back.
 home-assistant discovery is opt-in and publishes read-only diagnostic sensors, event entities for
 the physical controls, and read/write entities for the display power, scene, brightness,
 notifications and every durable setting. the full reference is [`RUNTIME.md`](../RUNTIME.md).

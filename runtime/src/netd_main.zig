@@ -1258,8 +1258,14 @@ const Netd = struct {
             .send_connect => {
                 var will_topic: [96]u8 = undefined;
                 const wt = self.topic(&will_topic, "availability");
-                var cid_buf: [48]u8 = undefined;
-                const cid = if (self.cfg.mqtt.client_id.len > 0) self.cfg.mqtt.client_id.slice() else std.fmt.bufPrint(&cid_buf, "tc002-{x:0>8}", .{self.status.boot_id}) catch "tc002";
+                // the client id has to be the *stable* device identity, not the boot id. with a new
+                // id every boot the broker keeps the dead session alive until its keepalive expires,
+                // and the old session's will ("offline", retained) then lands seconds *after* the
+                // new session published "online" — which left every home assistant entity
+                // unavailable after a reboot until something else republished. sharing one id makes
+                // the broker fire the old will at takeover instead, before this session publishes.
+                var cid_buf: [24]u8 = undefined;
+                const cid = if (self.cfg.mqtt.client_id.len > 0) self.cfg.mqtt.client_id.slice() else self.deviceId(&cid_buf);
                 const m = &self.cfg.mqtt;
                 const space = self.mqttSpace();
                 const n = mqtt.encodeConnect(space, .{
@@ -1276,17 +1282,18 @@ const Netd = struct {
                 self.mqttFlush();
             },
             .send_subscribe => {
-                var tb: [7][96]u8 = undefined;
-                var topics: [7][]const u8 = undefined;
-                const names = [_][]const u8{ "cmd/scene", "cmd/action", "cmd/notify", "cmd/frame", "cmd/config", "cmd/screen", "cmd/input" };
+                var tb: [8][96]u8 = undefined;
+                var topics: [8][]const u8 = undefined;
+                // "availability" is ours: we subscribe to it only to spot a stale will, see onMqttPublish
+                const names = [_][]const u8{ "cmd/scene", "cmd/action", "cmd/notify", "cmd/frame", "cmd/config", "cmd/screen", "cmd/input", "availability" };
                 for (names, 0..) |n, i| topics[i] = self.topic(&tb[i], n);
                 var birth_buf: [96]u8 = undefined;
                 const birth = std.fmt.bufPrint(&birth_buf, "{s}/status", .{self.cfg.discovery_prefix.slice()}) catch "homeassistant/status";
-                var all: [8][]const u8 = undefined;
+                var all: [9][]const u8 = undefined;
                 for (topics, 0..) |t, i| all[i] = t;
-                all[7] = birth;
+                all[8] = birth;
                 const space = self.mqttSpace();
-                const n = mqtt.encodeSubscribe(space, self.client.packetId(), if (self.cfg.discovery) all[0..8] else all[0..7], 1) catch return;
+                const n = mqtt.encodeSubscribe(space, self.client.packetId(), if (self.cfg.discovery) all[0..9] else all[0..8], 1) catch return;
                 self.mqttQueue(n);
                 self.m_connected = true;
                 log.info("mqtt connected", .{});
@@ -1405,6 +1412,19 @@ const Netd = struct {
             if (std.mem.eql(u8, p.payload, "online")) self.discoveryStart(false, now);
             return;
         }
+        // our own availability topic, which we subscribe to purely to notice a stale will: a dead
+        // session's "offline" can arrive after this session's "online" (a broker restart replays
+        // wills, and a client id that changed across a reboot leaves the old session to time out),
+        // and the retained value is what home assistant believes. say "online" again rather than
+        // leave every entity unavailable.
+        var ab: [96]u8 = undefined;
+        if (std.mem.eql(u8, p.topic, self.topic(&ab, "availability"))) {
+            if (self.m_connected and std.mem.eql(u8, p.payload, "offline")) {
+                log.info("mqtt: stale offline on availability, republishing online", .{});
+                self.mqttPublish("availability", "online", 1, true);
+            }
+            return;
+        }
         if (p.retain) return; // retained deliveries are never commands
         var pb: [96]u8 = undefined;
         const cmd_prefix = self.topic(&pb, "cmd/");
@@ -1460,9 +1480,13 @@ const Netd = struct {
                     // own them: any admin field makes this a real config patch, which the supervisor
                     // validates, applies live and persists exactly as the http PATCH does. the
                     // broker is the only gate on that, which is why it is documented as a trust
-                    // decision. a patch of only control fields stays transient, so a dragged
-                    // brightness slider does not write flash on every step.
-                    const admin_fields = cp.timezone != null or cp.ntp_server != null or cp.ntp_interval_s != null or cp.frame_timeout_ms != null or cp.metrics_interval_s != null or cp.discovery != null or cp.discovery_prefix != null or cp.clock_font != null or cp.clock_colour_mode != null or cp.clock_colour != null or cp.clock_colour2 != null or cp.clock_gradient != null or cp.clock_spread != null or cp.clock_digit != null or cp.ip_mode != null or cp.night != null or cp.night_brightness != null or cp.night_lead_min != null or cp.location != null or cp.location_auto != null;
+                    // decision. only a brightness-only patch stays transient, so a dragged slider
+                    // does not write flash on every step. the scene and the generator are durable:
+                    // applyConfigLive re-sends set_base from the *stored* base whenever the base or
+                    // the generator changes, so a transient base would snap the scene back to the
+                    // stored one — and drop the generator with it, since a generator only shows
+                    // while the art base is up — on the very next settings change.
+                    const admin_fields = cp.base != null or cp.generator != null or cp.timezone != null or cp.ntp_server != null or cp.ntp_interval_s != null or cp.frame_timeout_ms != null or cp.metrics_interval_s != null or cp.discovery != null or cp.discovery_prefix != null or cp.clock_font != null or cp.clock_colour_mode != null or cp.clock_colour != null or cp.clock_colour2 != null or cp.clock_gradient != null or cp.clock_spread != null or cp.clock_digit != null or cp.ip_mode != null or cp.night != null or cp.night_brightness != null or cp.night_lead_min != null or cp.location != null or cp.location_auto != null;
                     if (admin_fields) {
                         const w = messages.ConfigPatch.fromApi(cp) catch {
                             var o = Out{ .buf = &json_buf };
@@ -1473,9 +1497,7 @@ const Netd = struct {
                         self.mqttRelay(.{ .config_patch = w }, self.newId(), 0, now);
                         return;
                     }
-                    const rid = self.newId();
-                    if (cp.brightness) |b| self.mqttRelay(.{ .brightness = .{ .value = b } }, rid, 0, now);
-                    if (cp.base) |b| self.mqttRelay(.{ .set_base = .{ .base = @intFromEnum(b), .generator = if (cp.generator) |g| @intFromEnum(g) else 0xff, .seed = 0 } }, rid + 1, 0, now);
+                    if (cp.brightness) |b| self.mqttRelay(.{ .brightness = .{ .value = b } }, self.newId(), 0, now);
                 },
                 else => {},
             },
@@ -1550,7 +1572,9 @@ const Netd = struct {
         // action/notify topics, which require request_id + epoch — a fixed request_id is fine (no
         // dedup) and epoch 0 is accepted (the supervisor applies against the live renderer epoch).
         .{ .key = "power", .name = "display power", .component = .@"switch", .topic = "state", .template = "{{ 'ON' if value_json.power else 'OFF' }}", .device_class = "outlet", .diagnostic = false, .command = "cmd/action", .payload_on = "{\\\"action\\\":\\\"power\\\",\\\"power\\\":true,\\\"request_id\\\":\\\"1\\\",\\\"epoch\\\":0}", .payload_off = "{\\\"action\\\":\\\"power\\\",\\\"power\\\":false,\\\"request_id\\\":\\\"1\\\",\\\"epoch\\\":0}" },
-        .{ .key = "scene", .name = "scene", .component = .select, .topic = "state", .template = "{{ value_json.scene }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"base\\\": value} | to_json }}", .options = "\"clock\",\"art\",\"ip\"" },
+        // the base scenes are clock, art and canvas (there is no "ip" base; `ip_mode` below only
+        // chooses how an address is laid out). the state document calls this field `base`.
+        .{ .key = "scene", .name = "scene", .component = .select, .topic = "state", .template = "{{ value_json.base }}", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"base\\\": value} | to_json }}", .options = "\"clock\",\"art\",\"canvas\"" },
         .{ .key = "brightness", .name = "brightness", .component = .number, .topic = "state", .template = "{{ value_json.brightness }}", .unit = "%", .diagnostic = false, .command = "cmd/config", .command_template = "{{ {\\\"brightness\\\": value | int} | to_json }}", .min = 0, .max = 100 },
         .{ .key = "notify", .name = "notification", .component = .text, .diagnostic = false, .command = "cmd/notify", .command_template = "{{ {\\\"text\\\": value, \\\"request_id\\\": \\\"1\\\", \\\"epoch\\\": 0} | to_json }}" },
         // durable ("admin") settings, writable: each commands cmd/config with one flat patch field
