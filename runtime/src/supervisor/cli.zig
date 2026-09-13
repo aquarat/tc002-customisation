@@ -7,9 +7,13 @@ pub const usage =
     \\  --profile dev|hardened  dev leaves adbd alone; hardened resets persist.sys.zkdebug=0 at boot (dev)
     \\  --renderer PATH         candidate renderer (/tmp/tc002/tc002d)
     \\  --fallback PATH         fallback renderer after three failures in sixty seconds (same as --renderer)
-    \\  --dir PATH              volatile runtime directory: binaries, log, lock (/tmp/tc002)
+    \\  --dir PATH              volatile runtime directory: log, lock, credentials-if-no-/data (/tmp/tc002)
+    \\  --bin-dir PATH          directory holding the renderer, netd and ntfy binaries (defaults to --dir)
+    \\  --netup-dir PATH        directory with busybox + tc002-netup.sh; set to bring wlan0 up at boot (off)
     \\  --state PATH            durable settings and credentials (/data/tc002/state); falls back to --dir
     \\  --lock PATH             panel lock file (/tmp/tc002/panel.lock)
+    \\  --log PATH              when started by the bootstrap, log here instead of <dir>/supervisor.log
+    \\                          (use a /data path to keep a boot-test log across a wifi drop or reboot)
     \\  --tz RULE               posix tz rule or iana zone name; the renderer gets the rule (UTC0)
     \\  --keymap L,M,R,K        keycodes for left, middle, right, knob (108,105,106,103)
     \\  --keys PATH             button evdev node (/dev/input/event67)
@@ -33,10 +37,19 @@ pub const Config = struct {
     renderer: [:0]const u8 = "/tmp/tc002/tc002d",
     fallback: ?[:0]const u8 = null,
     dir: [:0]const u8 = "/tmp/tc002",
+    /// where the renderer/netd/ntfy binaries live when it is not --dir (a flashed image keeps them
+    /// on the read-only /res, with --dir a writable tmpfs directory). empty means "use --dir".
+    bin_dir: [:0]const u8 = "",
+    /// directory holding busybox, tc002-netup.sh and tc002-udhcpc.script. when set, the supervisor
+    /// brings wlan0 up at boot the way the stock app would (a flashed runtime has no stock app to
+    /// do it). empty means the network is assumed already up (the warm/dev path).
+    netup_dir: [:0]const u8 = "",
     /// settings and credentials live here, on the persistent jffs2 partition, so they survive a
     /// power cycle. the layout under it matches the one under --dir, so falling back is a swap.
     state: [:0]const u8 = "/data/tc002/state",
     lock_path: [:0]const u8 = "/tmp/tc002/panel.lock",
+    /// where the bootstrap-started supervisor redirects its log; empty means <dir>/supervisor.log
+    log_path: [:0]const u8 = "",
     tz_rule: [:0]const u8 = "UTC0",
     keymap_text: [:0]const u8 = "108,105,106,103",
     keymap: evdev.KeyMap = .{},
@@ -86,7 +99,7 @@ pub fn parse(args: []const [:0]const u8) ParseError!Outcome {
             c.from_bootstrap = true;
             continue;
         }
-        const known = [_][]const u8{ "--profile", "--renderer", "--fallback", "--dir", "--state", "--lock", "--tz", "--keymap", "--keys", "--knob", "--ip-poll", "--mcu", "--mcu-baud", "--mcu-poll" };
+        const known = [_][]const u8{ "--profile", "--renderer", "--fallback", "--dir", "--bin-dir", "--netup-dir", "--state", "--lock", "--log", "--tz", "--keymap", "--keys", "--knob", "--ip-poll", "--mcu", "--mcu-baud", "--mcu-poll" };
         var is_known = false;
         for (known) |k| is_known = is_known or std.mem.eql(u8, a, k);
         if (!is_known) return error.UnknownOption;
@@ -101,10 +114,16 @@ pub fn parse(args: []const [:0]const u8) ParseError!Outcome {
             c.fallback = v;
         } else if (std.mem.eql(u8, a, "--dir")) {
             c.dir = v;
+        } else if (std.mem.eql(u8, a, "--bin-dir")) {
+            c.bin_dir = v;
+        } else if (std.mem.eql(u8, a, "--netup-dir")) {
+            c.netup_dir = v;
         } else if (std.mem.eql(u8, a, "--state")) {
             c.state = v;
         } else if (std.mem.eql(u8, a, "--lock")) {
             c.lock_path = v;
+        } else if (std.mem.eql(u8, a, "--log")) {
+            c.log_path = v;
         } else if (std.mem.eql(u8, a, "--tz")) {
             c.tz_rule = v;
         } else if (std.mem.eql(u8, a, "--keymap")) {

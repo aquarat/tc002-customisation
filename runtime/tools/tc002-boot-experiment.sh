@@ -18,9 +18,9 @@ BOOTSTRAP=$DEV/libtc002-bootstrap.so
 
 die() { echo "$*" >&2; exit 1; }
 dsh() { adb shell "$@" | tr -d '\r'; }
-procs() { dsh ps | grep -E 'zkgui|tc002' | awk '{printf "%s:%s ", $1, $5}'; echo; }
+procs() { dsh ps | grep -E 'zkgui|tc002-supervisor|tc002d' | awk '{printf "%s:%s ", $1, $5}'; echo; }
 
-wait_gone() { for _ in $(seq 1 40); do adb shell ps | grep -q -E 'zkgui|tc002' || return 0; sleep 0.25; done; return 1; }
+wait_gone() { for _ in $(seq 1 40); do adb shell ps | grep -q -E 'zkgui|tc002-supervisor|tc002d' || return 0; sleep 0.25; done; return 1; }
 
 # stop zkswe, reset the property, start zkswe, and print uptime before/after the property is raised
 timed_restart() {

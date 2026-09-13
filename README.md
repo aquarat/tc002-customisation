@@ -362,17 +362,15 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwo
 - the `adopt` / `setWifiConfig` write path is documented from the firmware's own
   setup page but **not executed** here, since it would drop the test device off
   the network. confirm it against a factory-fresh unit before relying on it.
-- the custom runtime in `runtime/` has been run on the device **volatile only**
-  (everything under `/tmp`, stock after a power cycle) and measured on a warm
-  system; there is no persistent install, no tls and no sntp yet. see
-  [`RUNTIME.md`](RUNTIME.md#what-is-not-there-yet).
-- the path to a persistent install is mapped: the `update.img` format is
-  decoded and reproduced by [`tc002-update-img.py`](tc002-update-img.py), the
-  flasher writes the `res` partition from linux with no signature check, and
-  the two things that block flashing the runtime today (the bootstrap defeats
-  the vendor's recovery, and dhcp lives in the loader it replaces) are
-  documented with their fixes in [`FIRMWARE.md`](FIRMWARE.md). **no custom
-  image has been flashed yet.**
+- the custom runtime in `runtime/` also runs **volatile** (everything under
+  `/tmp`, stock after a power cycle) for development; sntp works, tls does not.
+  see [`RUNTIME.md`](RUNTIME.md#what-is-not-there-yet).
+- the runtime is also **flashed and persistent** (2026-09-13): it is written to
+  the `res` partition with [`tc002-update-img.py`](tc002-update-img.py) and
+  boots on its own across power cycles, bringing wifi up, drawing the panel,
+  serving the api and syncing the clock without the stock app. the
+  `update.img` format, the flash procedure, the recovery design and the
+  cold-boot issues that had to be fixed are in [`FIRMWARE.md`](FIRMWARE.md).
 
 ## disclaimer
 

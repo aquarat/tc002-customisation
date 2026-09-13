@@ -81,7 +81,10 @@ usage: tc002-supervisor [options]
   --profile dev|hardened  dev leaves adbd alone; hardened resets persist.sys.zkdebug=0 at boot (dev)
   --renderer PATH         candidate renderer (/tmp/tc002/tc002d)
   --fallback PATH         fallback renderer after three failures in sixty seconds (same as --renderer)
-  --dir PATH              runtime directory (/tmp/tc002)
+  --dir PATH              runtime directory: log, lock, pidfile (/tmp/tc002)
+  --bin-dir PATH          directory of the renderer/netd/ntfy binaries (defaults to --dir; a flashed image passes /res/bin)
+  --netup-dir PATH        directory with busybox + tc002-netup.sh; set to bring wlan0 up at boot (off unless flashed)
+  --log PATH              when started by the bootstrap, log here instead of <dir>/supervisor.log
   --lock PATH             panel lock file (/tmp/tc002/panel.lock)
   --tz RULE               posix tz rule handed to the renderer (UTC0)
   --keymap L,M,R,K        keycodes for left, middle, right, knob (108,105,106,103)
@@ -200,7 +203,9 @@ on one udp socket connected to that ipv4 address on port 123: no dns, no
 thread, no rtc. it sends a 48-byte ntpv4 request as soon as wlan0 has an
 address and then every `ntp_interval_s` (300 or 600). a reply is accepted only
 when it echoes the request's transmit timestamp, comes from a synchronised
-server with stratum 1..15, carries nonzero server timestamps, a date within
+server — leap indicator 0, 1 or 2, never the 3 that is the server's own
+"my clock is unsynchronised" alarm — with stratum 1..15, carries nonzero
+server timestamps, a date within
 twenty years of the client's build date (the era reference: a 1970 clock after
 a cold boot still resolves the 32-bit ntp seconds to the right era) and a round
 trip under one second. offset and delay are computed from all four timestamps.
@@ -217,6 +222,19 @@ the ~70 ppm oscillator drift accumulates (about 21 ms per 300 s) and is taken
 out at the next exchange. measured on 2026-09-07 against the home assistant
 host's chrony (stratum 3): first exchange −187 ms offset at 25 ms round trip,
 stepped; the following exchanges within ±10 ms at 2 ms round trip, slewed.
+
+a practical note on the server, from 2026-09-13: the `ntp_server` must be one
+that declares itself synchronised (leap indicator 0). many consumer routers'
+built-in "ntp server" do not — one tested here answered on udp/123 with the
+correct time, a real upstream reference and stratum 3, but kept the leap
+indicator pinned at 3 permanently, so the client rejected every reply
+(`sntp: server clock unsynchronised (li 3)` in the log) and `time.state`
+stayed `unsynced`. this is correct client behaviour, not a bug, and there is
+no override. use a public server by ip (the device reached and stepped to
+google's `216.239.35.0`, stratum 1, in one exchange) or a properly disciplined
+ntp daemon on the lan (chrony/ntpd declaring li 0); a bare router relay is
+often not one. the stock app does not hit this because its own client does not
+check the leap indicator.
 
 ### the night brightness schedule
 
@@ -1431,22 +1449,21 @@ all on a warm device that had been up for days, under the lock, on
   and reports them; nothing reads the microphone, sets the led current gain
   or uses the power-off command, and the low-battery behaviour is not
   reproduced. run on usb power.
-- **persistence.** settings and credentials are durable (`/data/tc002/state`),
-  but the **binaries are not**: they are pushed to `/tmp` and a power cycle
-  brings the stock app back, so the runtime is still started by hand. a
-  self-starting runtime means rewriting the `res` partition, since nothing in
-  the boot chain reads a writable location; the design, the evidence and the
-  risks are in the vault note `tc002-customisation/2026-09-09/boot-persistence`
-  and, from 2026-09-12, in [`FIRMWARE.md`](FIRMWARE.md): the vendor image
-  format is decoded and reproduced by
-  [`tc002-update-img.py`](tc002-update-img.py), the flasher writes mtd3 from
-  linux with no signature check, and the loader's ordering is now known: it
-  `dlopen`s the app **before** the upgrade check, so this bootstrap's
-  exec-in-constructor disables every vendor recovery route, and the dhcp
-  client is a thread of the loader, so a cold boot through the bootstrap
-  would come up without an address. both need fixing in the bootstrap and
-  the supervisor before anything is flashed; the paired-slot install and the
-  recovery rehearsal do not exist yet.
+- **persistence — done (2026-09-13).** the runtime is flashed to the `res`
+  partition and boots on its own across power cycles; settings and credentials
+  stay on `/data/tc002/state`. the full story — the vendor image format, the
+  flasher, the flash procedure, and the four cold-boot issues that only
+  appeared once flashed (the loader doesn't pre-bring-up wifi, gpio 35 needs
+  exporting for the panel, netd needs `/res/bin` at 0755 to exec as uid 1001,
+  and sntp must re-open its socket once the address arrives) — is in
+  [`FIRMWARE.md`](FIRMWARE.md). the boot-path pieces added for it: the
+  bootstrap's boot-fail self-heal and the supervisor's `--bin-dir` /
+  `--netup-dir` / `--log`, its wifi bring-up (`boot/tc002-netup.sh`, retried on
+  a link loss), its panel-ready gate (exports gpio 35, waits for `spidev0.0`),
+  its upgrade-yield and 120-second no-network hand-back to the stock app, all
+  in [`sys/recovery.zig`](runtime/src/sys/recovery.zig) and the supervisor.
+  what is still not done: a paired-slot / A-B install (a bad flash is recovered
+  by the reset-button reflash of stock, not by an alternate slot), and tls.
 - **confinement.** netd is uid 1001, but `/dev/socket/property_service` is
   world-writable on this init, so the uid change alone does not deny it the
   property service. recorded as a gap, not claimed as isolated.

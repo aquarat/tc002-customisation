@@ -57,6 +57,15 @@ case "${1:-status}" in
         adb push "$RUNTIME/zig-out/$f" "$DEV/$(basename "$f")" >/dev/null || { "$LOCK" release "push of $f failed"; die "push of $f failed"; }
     done
     adb shell "chmod 755 $DEV/tc002d $DEV/tc002-supervisor $DEV/tc002-netd $DEV/tc002-ntfy" >/dev/null
+    # the network bring-up helper needs busybox and the two scripts (only used when the supervisor
+    # is started with --netup-dir; harmless to push otherwise). busybox is a static armv7 build the
+    # repo does not vendor: point TC002_BUSYBOX at one (e.g. from `docker cp busybox:musl`).
+    for s in "$RUNTIME/boot/tc002-netup.sh" "$RUNTIME/boot/tc002-udhcpc.script"; do
+        [ -f "$s" ] && adb push "$s" "$DEV/$(basename "$s")" >/dev/null && adb shell "chmod 755 $DEV/$(basename "$s")" >/dev/null
+    done
+    if [ -n "${TC002_BUSYBOX:-}" ] && [ -f "${TC002_BUSYBOX}" ]; then
+        adb push "$TC002_BUSYBOX" "$DEV/busybox" >/dev/null && adb shell "chmod 755 $DEV/busybox" >/dev/null && echo "pushed busybox"
+    fi
     dsh "ls -la $DEV"
     "$LOCK" release "push done ($(basename "$(cd "$RUNTIME/.." && git branch --show-current 2>/dev/null || echo unknown)"))"
     ;;

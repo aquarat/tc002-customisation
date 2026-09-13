@@ -22,6 +22,75 @@ It reproduces the vendor's `update.img` byte for byte from its own payload.
 
 ---
 
+## Status: flashed and persistent (2026-09-13)
+
+The custom runtime **is now flashed to the `res` partition and boots on its
+own**. Across clean reboots the supervisor, the renderer (panel drawing), the
+network daemon (authenticated api), cold-boot wifi and the sntp-synced clock
+all come up unattended, and the boot-fail counter arms and clears at 60 s. The
+runtime binaries live in `/res/bin`, the bootstrap in `/res/lib`, the stock
+`libzkgui.so` is kept for the fallback, and `/res/etc/EasyUI.cfg` points
+`startupLibPath` at the bootstrap. Nothing else on flash changed.
+
+Four things only surfaced once it was flashed for real, because the warm /
+volatile path always had the stock app set them up first. Each is fixed:
+
+- **Cold boot has no driver or supplicant yet.** The vendor loader does *not*
+  finish `NetManager::start` before our bootstrap takes over, so on a cold
+  boot nothing has loaded the aic8800 driver or started `wpa_supplicant`.
+  `tc002-netup.sh`'s "insmod if `wlan0` absent" and "start supplicant if not
+  running" fallbacks are therefore essential, not belt-and-braces.
+- **The renderer needs gpio 35 exported.** The panel is `spidev0.0` plus the
+  gpio-35 frame latch; the renderer opens `/sys/class/gpio/gpio35/value`,
+  which only exists once the gpio is exported. The stock app exports it; on a
+  cold boot nothing did, so the renderer failed "cannot open the panel" and
+  was halted. The supervisor now exports gpio 35 (and sets it output) and
+  gates the first renderer spawn until both `spidev0.0` and the gpio value
+  file are openable, which also rides out the spi controller's probe race.
+- **netd runs as uid 1001 and must reach its binary.** A file at 0770 owned
+  1000:1000 (the stock `res` mode) is fine for the root stock app but the
+  unprivileged network daemon cannot traverse `/res/bin` or exec its binary.
+  The image sets the runtime binaries **and** the directories that hold them
+  to 0755. (Symptom was netd exiting 127 in a one-per-second loop.)
+- **sntp disabled itself before the network was up.** The client opened its
+  udp socket at ~6 s, before `wlan0` had an address, the connect failed, and
+  the old code disabled sntp for the whole boot. It now re-opens the socket
+  when the address arrives, so the clock syncs a few seconds into a cold boot.
+
+**The flash procedure that worked.** Steps 1–2 (build the runtime for the
+image and assemble the `UPDATE.img`) are automated by
+[`runtime/tools/tc002-mkimage.sh`](runtime/tools/tc002-mkimage.sh)
+(`TC002_BUSYBOX=<static armv7 busybox> tc002-mkimage.sh <stock update.img or
+mtd3 dump> UPDATE.img`); it does exactly what is spelled out here. From a host
+with zig 0.16 and `squashfs-tools`:
+
+1. Unpack a stock `res` (`tc002-update-img.py unpack`, or a dump of
+   `mtdblock3`), add `tc002-supervisor`, `tc002d`, `tc002-netd`,
+   `tc002-ntfy`, a static armv7 `busybox`, `tc002-netup.sh`,
+   `tc002-udhcpc.script` under `bin/` and `libtc002-bootstrap.so` under
+   `lib/`, keep the stock `libzkgui.so`, and point `etc/EasyUI.cfg` at the
+   bootstrap. `chmod 0755` the added files **and** the `res`, `bin`, `lib`,
+   `etc` directories.
+2. `mksquashfs res-root res.sqsh -comp xz -b 131072 -no-xattrs -force-uid
+   1000 -force-gid 1000 -noappend`, then `tc002-update-img.py pack res.sqsh
+   UPDATE.img` and `inspect` it (about 4.4 MB, 53 % of the 8 MiB partition).
+3. Flash a **no-op image first** (a byte-identical repack of the current
+   `res`) to prove the flasher on the unit with zero behaviour change.
+4. Put the device on the stock loader (`sed` the flashed
+   `EasyUI.cfg` back to `libzkgui.so` into `/tmp/EasyUI.cfg`, then
+   `setprop ctl.stop zkswe; setprop ctl.start zkswe`), then
+   `adb push UPDATE.img /tmp/update.img; setprop sys.zkupgrade.dir /tmp;
+   setprop sys.zkupgrade.flag 255; setprop ctl.stop zkswe;
+   setprop ctl.start zkswe`. The loader's upgrade check flashes `mtd3` and
+   reboots into the new runtime.
+
+Recovery still rests on the code self-heal (boot-fail counter → stock app,
+120 s no-network → stock app) and the reset-button reflash of the stock image
+from the UDISK; the no-op rehearsal proved that reflash mechanism works on
+this unit. The serial/U-Boot route was never needed.
+
+---
+
 ## The pieces on the device
 
 | path | what | size |

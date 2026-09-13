@@ -5,8 +5,13 @@ pub fn build(b: *std.Build) void {
     if (!std.mem.eql(u8, builtin.zig_version_string, "0.16.0")) @panic("this project pins zig 0.16.0");
 
     const supervisor_path = b.option([]const u8, "supervisor_path", "path the bootstrap execs") orelse "/tmp/tc002/tc002-supervisor";
+    // when set (a flashed image: /res/bin), the bootstrap tells the supervisor where its binaries
+    // and the network bring-up scripts live, via --bin-dir and --netup-dir. empty keeps the volatile
+    // behaviour (everything under --dir, no network bring-up).
+    const bin_dir = b.option([]const u8, "bin_dir", "directory of the runtime binaries and boot scripts on the device (image: /res/bin)") orelse "";
     const options = b.addOptions();
     options.addOption([]const u8, "supervisor_path", supervisor_path);
+    options.addOption([]const u8, "bin_dir", bin_dir);
 
     const device = b.resolveTargetQuery(.{
         .cpu_arch = .arm,
@@ -138,6 +143,7 @@ pub fn build(b: *std.Build) void {
     for (variants) |v| {
         const host_options = b.addOptions();
         host_options.addOption([]const u8, "supervisor_path", v.path);
+        host_options.addOption([]const u8, "bin_dir", ""); // host test: volatile-style argv (no --bin-dir)
         const lib = b.addLibrary(.{
             .name = v.name,
             .linkage = .dynamic,

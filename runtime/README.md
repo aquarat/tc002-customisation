@@ -26,7 +26,15 @@ zig build wasm       # the scene code as wasm for the console preview -> ../pane
 ```
 
 `-Dsupervisor_path=/res/bin/tc002-supervisor` selects the production exec path; the default is the
-volatile `/tmp/tc002/tc002-supervisor`.
+volatile `/tmp/tc002/tc002-supervisor`. for a flashed image, also pass `-Dbin_dir=/res/bin`, which
+makes the bootstrap hand the supervisor `--bin-dir /res/bin --netup-dir /res/bin` so it finds its
+binaries and the boot scripts on the read-only `res` partition and brings wifi up itself.
+
+`boot/` holds the two shell helpers that ship in a flashed image: `tc002-netup.sh` (load the
+aic8800 driver if needed, start `wpa_supplicant`, run `udhcpc` tracked by a pidfile) and
+`tc002-udhcpc.script` (configure `wlan0` from the lease). `src/sys/recovery.zig` is the boot-fail
+self-heal and the stock-config fallback. the persistent install, the flash procedure and the
+cold-boot findings are in [`../FIRMWARE.md`](../FIRMWARE.md).
 
 ## sharing the device with another agent
 

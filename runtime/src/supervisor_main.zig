@@ -6,6 +6,7 @@ const std = @import("std");
 const sys = @import("sys/linux.zig");
 const log = @import("sys/log.zig");
 const props = @import("sys/props.zig");
+const recovery = @import("sys/recovery.zig");
 const codec = @import("ipc/codec.zig");
 const messages = @import("ipc/messages.zig");
 const evdev = @import("input/evdev.zig");
@@ -54,6 +55,18 @@ const relay_timeout_ns: u64 = 2 * ns_per_s;
 const relay_max = 32;
 const netd_restart_ns: u64 = 1 * ns_per_s;
 const sample_period_ns: u64 = 5 * ns_per_s;
+/// on the flashed boot path: hand back to the stock app if wlan0 has no address this long after
+/// boot (a broken network bring-up must not leave the device unreachable), and clear the boot-fail
+/// counter once the runtime has stayed up and networked at least this long (a healthy boot).
+const netup_timeout_ns: u64 = 120 * ns_per_s;
+const healthy_ns: u64 = 60 * ns_per_s;
+/// re-run the network bring-up this often while wlan0 has no address, so a transient wifi loss
+/// (disassociation, a released lease) self-recovers instead of waiting for the stock handback.
+const netup_retry_ns: u64 = 30 * ns_per_s;
+/// on a cold boot the spi controller may still be probing when we start this early; hold the very
+/// first renderer spawn until /dev/spidev0.0 is openable, up to this long, so the renderer does not
+/// fail-to-open and get halted racing the probe. only the initial bring-up is gated.
+const panel_wait_ns: u64 = 45 * ns_per_s;
 const netd_uid: u32 = 1001;
 const netd_gid: u32 = 1001;
 const http_port: u16 = 80;
@@ -398,6 +411,20 @@ const Supervisor = struct {
     /// the night brightness schedule; the phase it is in lives in the snapshot
     night: night.Schedule = .{},
     next_night_poll: u64 = 0,
+    // boot-path recovery (flashed runtime, --from-bootstrap)
+    /// monotonic time the supervisor's main loop began, for the network and healthy deadlines
+    boot_ns: u64 = 0,
+    /// the wifi bring-up helper, forked once at boot when --netup-dir is set; reaped when it exits
+    netup_pid: ?sys.Pid = null,
+    netup_requested: bool = false,
+    /// when the last network bring-up was spawned, for the retry cadence
+    last_netup_ns: u64 = 0,
+    /// next time to check the link state (carrier + address) for the retry decision
+    next_net_check_ns: u64 = 0,
+    /// the panel device has been seen openable; gates the first renderer spawn on a cold boot
+    panel_seen_ready: bool = false,
+    /// the boot-fail counter (armed by the bootstrap) has been cleared after a healthy boot
+    fail_cleared: bool = false,
 
     fn send(self: *Supervisor, msg: messages.Message) void {
         self.request_id += 1;
@@ -716,6 +743,113 @@ const Supervisor = struct {
         }
         self.snapshot.config_revision = c.revision;
         self.snapshot.saved_revision = c.saved_revision;
+    }
+
+    // the wifi bring-up helper (flashed boot path). runs the shipped tc002-netup.sh through
+    // busybox once at boot: loads the aic8800 driver if nothing did, starts wpa_supplicant, waits
+    // for association and runs udhcpc as a renewing daemon. fire-and-forget; it exits once udhcpc
+    // has backgrounded and is reaped in the loop. pollIp then reports the address it obtained.
+    fn spawnNetup(self: *Supervisor, dir: [:0]const u8) void {
+        const pid = sys.fork() catch |e| {
+            log.err("netup fork failed: {s}", .{sys.errText(e)});
+            return;
+        };
+        if (pid == 0) {
+            sys.unblockAllSignals();
+            sys.setSignalDisposition(.TERM, linux.SIG.DFL);
+            var bb_buf: [192]u8 = undefined;
+            var sh_buf: [192]u8 = undefined;
+            const bb = std.fmt.bufPrintZ(&bb_buf, "{s}/busybox", .{dir}) catch sys.exit(127);
+            const sh = std.fmt.bufPrintZ(&sh_buf, "{s}/tc002-netup.sh", .{dir}) catch sys.exit(127);
+            // pass the writable runtime dir for the udhcpc pidfile (dir may be read-only /res/bin)
+            const argv = [_:null]?[*:0]const u8{ bb.ptr, "sh", sh.ptr, dir.ptr, self.cfg_cli.dir.ptr };
+            const envp = [_:null]?[*:0]const u8{};
+            sys.execve(bb.ptr, &argv, &envp) catch {};
+            sys.exit(127);
+        }
+        self.netup_pid = pid;
+        self.netup_requested = true;
+        self.last_netup_ns = sys.monotonicNs();
+        log.info("netup started (pid {d}) from {s}", .{ pid, dir });
+    }
+
+    /// true when wlan0 is not carrying a link (disassociated). read from sysfs; a missing or "0"
+    /// value counts as down. a dead wpa_supplicant leaves the stale address in place, so the
+    /// carrier is the signal that catches a disassociation the address alone would miss.
+    fn carrierDown(self: *Supervisor) bool {
+        _ = self;
+        var buf: [8]u8 = undefined;
+        const text = sys.readFile("/sys/class/net/wlan0/carrier", &buf) catch return true;
+        return std.mem.indexOfScalar(u8, text, '1') == null;
+    }
+
+    /// while we own the network, re-run the bring-up on a cadence whenever the link is down (no
+    /// address, or no carrier), so a transient wifi loss recovers on its own: netup restarts
+    /// wpa_supplicant (reassociates) and brings a fresh udhcpc up. checked every few seconds; a
+    /// fresh bring-up is not launched more often than netup_retry_ns.
+    fn pollNetwork(self: *Supervisor, now: u64) void {
+        if (!self.netup_requested or self.netup_pid != null) return;
+        if (now < self.next_net_check_ns) return;
+        self.next_net_check_ns = now + 5 * ns_per_s;
+        const down = self.last_ip == null or self.carrierDown();
+        if (!down) return;
+        if (now -| self.last_netup_ns < netup_retry_ns) return;
+        log.warn("network down (address {s}, carrier {s}); re-running network bring-up", .{
+            if (self.last_ip == null) "none" else "present",
+            if (self.carrierDown()) "down" else "up",
+        });
+        self.spawnNetup(self.cfg_cli.netup_dir);
+    }
+
+    fn reapNetup(self: *Supervisor) void {
+        const pid = self.netup_pid orelse return;
+        _ = (sys.waitNoHang(pid) catch |e| switch (e) {
+            error.NoChild => @as(?u32, 0),
+            else => return,
+        }) orelse return;
+        self.netup_pid = null;
+        log.info("netup finished", .{});
+    }
+
+    /// kill the udhcpc daemon netup left running, so it does not fight the stock app's own dhcp
+    /// after we hand the panel back. busybox runs udhcpc with the process name "busybox", so it is
+    /// killed by the pidfile netup wrote, not by name. best effort.
+    fn killNetClients(self: *Supervisor) void {
+        if (!self.netup_requested) return;
+        var path_buf: [192]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/udhcpc.pid", .{self.cfg_cli.dir}) catch return;
+        var buf: [16]u8 = undefined;
+        const text = sys.readFile(path, &buf) catch return;
+        const pid = std.fmt.parseInt(sys.Pid, std.mem.trim(u8, text, " \t\r\n"), 10) catch return;
+        sys.kill(pid, .TERM);
+    }
+
+    /// the flashed boot path's recovery bookkeeping, run each loop. returns true when the caller
+    /// should hand the panel back to the stock app and exit. no-op unless started by the bootstrap.
+    fn bootRecovery(self: *Supervisor, now: u64) bool {
+        if (!self.cfg_cli.from_bootstrap) return false;
+        self.reapNetup();
+        const up = now -| self.boot_ns;
+        // self-heal: we took the network and it never came up -> the vendor app can, so step aside
+        if (self.netup_requested and self.last_ip == null and up > netup_timeout_ns) {
+            log.err("no wlan0 address {d}s after boot; writing stock EasyUI.cfg, handing back to the vendor app", .{up / ns_per_s});
+            // stop an in-flight bring-up first, so an orphaned netup cannot stop the supplicant or
+            // start a second udhcpc once the stock app owns the network again
+            if (self.netup_pid) |pid| {
+                sys.kill(pid, .KILL);
+                self.netup_pid = null;
+            }
+            self.killNetClients();
+            _ = recovery.writeStockCfg();
+            return true;
+        }
+        // healthy boot: networked and up a while -> clear the boot-fail counter the bootstrap armed
+        if (!self.fail_cleared and self.last_ip != null and up > healthy_ns) {
+            recovery.writeFailCount(0);
+            self.fail_cleared = true;
+            log.info("healthy boot: cleared the boot-fail counter", .{});
+        }
+        return false;
     }
 
     // the network daemon
@@ -1561,7 +1695,42 @@ const Supervisor = struct {
         }
     }
 
+    fn writeSysfs(path: [*:0]const u8, bytes: []const u8) void {
+        const fd = sys.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0) catch return;
+        defer sys.close(fd);
+        _ = sys.write(fd, bytes) catch {};
+    }
+
+    /// the panel is ready when the spi node and the latch gpio value file are both openable. on a
+    /// cold boot the stock app is not there to export gpio 35 (the frame latch) or to have let the
+    /// spi controller settle, so we export the gpio (idempotent; EBUSY when already exported is
+    /// ignored) and set it to output, then check both nodes. gates the first renderer spawn so it
+    /// does not fail-to-open the panel and get halted.
+    fn panelReady(self: *Supervisor) bool {
+        _ = self;
+        writeSysfs("/sys/class/gpio/export", "35");
+        writeSysfs("/sys/class/gpio/gpio35/direction", "out");
+        const spi = sys.open("/dev/spidev0.0", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0) catch return false;
+        sys.close(spi);
+        const gpio = sys.open("/sys/class/gpio/gpio35/value", .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0) catch return false;
+        sys.close(gpio);
+        return true;
+    }
+
     fn pollLifecycle(self: *Supervisor, now: u64) void {
+        // cold-boot gate: hold the lifecycle idle (no spawn yet) until the panel device is openable
+        // or the grace period passes, so the renderer's first spawn does not race the spi probe and
+        // halt. only the initial bring-up is affected; the rest of the loop (network, netd) runs.
+        if (!self.panel_seen_ready) {
+            if (self.panelReady()) {
+                self.panel_seen_ready = true;
+            } else if (now -| self.boot_ns < panel_wait_ns) {
+                return;
+            } else {
+                self.panel_seen_ready = true;
+                log.warn("panel /dev/spidev0.0 not openable after {d}s; spawning the renderer anyway", .{panel_wait_ns / ns_per_s});
+            }
+        }
         switch (lifecycle.poll(now)) {
             .none => {},
             .spawn => if (!self.shutting_down) self.spawn(now),
@@ -1703,6 +1872,10 @@ const Supervisor = struct {
         if (std.meta.eql(addr, self.last_ip)) return;
         self.last_ip = addr;
         self.sntp_link.client.setNetwork(addr != null, now); // sntp
+        // on a cold boot the sntp socket open at startup fails (no route yet) and leaves the client
+        // with no socket; once wlan0 has an address, (re)open it so sntp actually runs. only when a
+        // server is configured and the socket is not already open.
+        if (addr != null and self.cfg.ntp_server != null and self.sntp_link.fd == null) self.sntp_link.configure(self, now);
         if (addr) |a| log.info("wlan0 address {d}.{d}.{d}.{d}", .{ a[0], a[1], a[2], a[3] }) else log.info("wlan0 has no address", .{});
         self.send(.{ .ip_changed = .{ .present = if (addr != null) 1 else 0, .addr = addr orelse .{ 0, 0, 0, 0 } } });
     }
@@ -1749,7 +1922,7 @@ fn audit(environ: anytype, args: []const [:0]const u8, close_inherited: bool) vo
 /// when the loader exec'd us, stderr is whatever the loader had; keep the log in the runtime dir.
 fn redirectLog(cfg: cli.Config) void {
     var path_buf: [128]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, "{s}/supervisor.log", .{cfg.dir}) catch return;
+    const path = if (cfg.log_path.len > 0) cfg.log_path else std.fmt.bufPrintZ(&path_buf, "{s}/supervisor.log", .{cfg.dir}) catch return;
     sys.mkdir(cfg.dir, 0o700) catch {};
     const fd = sys.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644) catch return;
     sys.dup2(fd, 1) catch {};
@@ -1766,6 +1939,19 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
     if (tz.resolve(cfg.tz_rule)) |rule| {
         if (!std.mem.eql(u8, rule, cfg.tz_rule)) cfg.tz_rule = std.fmt.bufPrintZ(&tz_buf, "{s}", .{rule}) catch cfg.tz_rule;
     } else log.warn("--tz {s} is neither a posix rule nor a zone name; the renderer will refuse it", .{cfg.tz_rule});
+    // 0. flashed boot path only: if the vendor upgrade flag is set (the reset button, or a staged
+    // update), hand the panel straight back to the stock app so its loader runs the reflash. done
+    // before the anti-brick flag so we never claim to be running while stepping aside.
+    if (cfg.from_bootstrap) {
+        var flag_buf: [64]u8 = undefined;
+        const flag = props.get("sys.zkupgrade.flag", &flag_buf, property_timeout_ns);
+        if (flag.len > 0 and !std.mem.eql(u8, flag, "0")) {
+            redirectLog(cfg);
+            log.warn("upgrade pending (sys.zkupgrade.flag={s}); writing stock EasyUI.cfg, handing back to the vendor app", .{flag});
+            _ = recovery.writeStockCfg();
+            return 0;
+        }
+    }
     // 1. the anti-brick flag, before anything that could block or fail
     var property_ms: ?u64 = null;
     if (!cfg.no_property) {
@@ -1828,6 +2014,12 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
     try sys.epollAdd(ep, sigfd, linux.EPOLL.IN, @intFromEnum(Tag.signals));
     if (keys) |fd| try sys.epollAdd(ep, fd, linux.EPOLL.IN, @intFromEnum(Tag.keys));
 
+    // the renderer/netd/ntfy binaries live in --bin-dir when set (a flashed image keeps them on
+    // the read-only /res), otherwise beside the runtime dir as before.
+    const bin_base = if (cfg.bin_dir.len > 0) cfg.bin_dir else cfg.dir;
+    var renderer_buf: [160]u8 = undefined;
+    if (cfg.bin_dir.len > 0) cfg.renderer = std.fmt.bufPrintZ(&renderer_buf, "{s}/tc002d", .{cfg.bin_dir}) catch cfg.renderer;
+
     var s = Supervisor{ .cfg_cli = cfg, .cfg_dir_text = cfg.dir, .state_dir_text = cfg.state, .cfg_stats = cfg.stats, .ep = ep, .timer = timer, .sigfd = sigfd, .keys = keys, .self_pid = sys.getpid() };
     // settings and credentials belong on the persistent partition; if it cannot be used the
     // runtime still comes up, on the volatile directory, and says so rather than failing to start
@@ -1845,9 +2037,9 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
     } else |e| log.warn("no log pipe ({s}); the log ring holds only the supervisor's lines", .{sys.errText(e)});
     log.info("supervising {s} (fallback {s}) profile {s} pid {d}", .{ cfg.renderer, cfg.fallbackPath(), @tagName(cfg.profile), s.self_pid });
     var netd_path_buf: [160]u8 = undefined;
-    s.netd_path = std.fmt.bufPrintZ(&netd_path_buf, "{s}/tc002-netd", .{cfg.dir}) catch unreachable;
+    s.netd_path = std.fmt.bufPrintZ(&netd_path_buf, "{s}/tc002-netd", .{bin_base}) catch unreachable;
     var ntfy_path_buf: [160]u8 = undefined;
-    s.ntfy_path = std.fmt.bufPrintZ(&ntfy_path_buf, "{s}/tc002-ntfy", .{cfg.dir}) catch unreachable;
+    s.ntfy_path = std.fmt.bufPrintZ(&ntfy_path_buf, "{s}/tc002-ntfy", .{bin_base}) catch unreachable;
     s.loadNtfyCa();
     var boot: [4]u8 = undefined;
     sys.getrandom(&boot) catch {};
@@ -1882,6 +2074,12 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
     s.sntp_link.configure(&s, sys.monotonicNs());
     s.syncNight();
 
+    // 10. flashed boot path: bring wlan0 up the way the stock app would (a flashed runtime has no
+    // stock app to do it). fire-and-forget; pollIp reports the address, and bootRecovery hands back
+    // to stock if none arrives in time.
+    s.boot_ns = sys.monotonicNs();
+    if (cfg.netup_dir.len > 0) s.spawnNetup(cfg.netup_dir);
+
     var events: [8]sys.Event = undefined;
     while (true) {
         const now = sys.monotonicNs();
@@ -1892,6 +2090,8 @@ fn run(cfg_in: cli.Config, environ: anytype, args: []const [:0]const u8) !u8 {
         s.pollGesture(now);
         s.pollLifecycle(now);
         s.pollIp(now);
+        s.pollNetwork(now);
+        if (s.bootRecovery(now)) return 0;
         s.pushDeviceStatus(now);
         s.pollNight(now);
         s.drainNetd(now);
