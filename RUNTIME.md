@@ -1270,7 +1270,7 @@ random per-boot id. the set:
   renderer restarts, mqtt reconnects, night schedule, fps, frames presented,
   time sync state);
 - **controllable (read + write) entities.** the transient controls: a `switch`
-  for display power, a `select` for the scene (clock/art/ip), a `number` for
+  for display power, a `select` for the scene (clock/art/canvas), a `number` for
   brightness (0–100), and a `text` for a notification message. and the durable
   ("admin") settings, which are writable over mqtt too: `select`s for the clock
   font, colour mode, gradient and digit style, the ip layout, the art generator
@@ -1280,8 +1280,10 @@ random per-boot id. the set:
   entities read their current value from a retained `config` topic (the same
   document `GET /config` returns) and command one flat patch field each through
   `cmd/config`; the supervisor validates, applies live and persists them, so a
-  change made in ha survives a reboot. a patch of only control fields stays
-  transient, so a dragged brightness slider does not write flash per step.
+  change made in ha survives a reboot. a patch of `brightness` alone stays
+  transient, so a dragged brightness slider does not write flash per step; the
+  scene and the generator are persisted, for the reason given in the
+  [`cmd/config`](#mqtt) row.
   **the broker is the only gate on the admin surface** — anyone who can publish
   to it can rewrite durable settings, unlike the http api which needs the admin
   bearer token. the meta settings stay off mqtt deliberately: the discovery
