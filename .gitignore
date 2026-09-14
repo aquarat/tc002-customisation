@@ -8,3 +8,7 @@ __pycache__/
 *.img
 *.sqsh
 *.bin
+# local-only artefact store: the vendor image, our built image, the partition
+# dumps and the static busybox, with provenance and checksums. see
+# firmware-local/PROVENANCE.md
+/firmware-local/

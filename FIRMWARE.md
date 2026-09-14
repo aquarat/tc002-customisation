@@ -84,6 +84,25 @@ with zig 0.16 and `squashfs-tools`:
    setprop ctl.start zkswe`. The loader's upgrade check flashes `mtd3` and
    reboots into the new runtime.
 
+**Where the base image comes from, and what is worth keeping.** The vendor's
+own `res` image is on the device at `/mnt/storage/update.img` (2,773,564 bytes,
+md5 `f318f036651d6ab95ce05b25a7211c7e`, sha256
+`4a5db0fe78d1be91c101e6aee7766a59d60136cd68dde2540e99a7b6fb87fc82`): `adb pull`
+it and `inspect` it to confirm you have the same base this work was built on.
+That file is also what the reset button reflashes from, so it is the rollback
+path as well as the build input. Dump any partition with
+`adb shell cat /dev/mtdblockN > mtdN.bin`; **dump `mtd3` before the first
+flash**, because afterwards it holds the custom image and the original is gone
+from the device. Do not publish a dump of `mtd6` (data): the wifi credentials
+and the api tokens live there. The images and dumps are gitignored — they are
+Ulanzi's, not ours — so keep them somewhere durable of your own;
+`firmware-local/PROVENANCE.md` is the layout this checkout uses.
+
+The `busybox` the image needs is **1.38.0, static, armv7** (the vendor's own
+67 kb busybox in `/bin` is not enough: it has no `udhcpc`, which the runtime
+shells out to for dhcp). Any static armv7 build of 1.38.0 will do; it is passed
+in with `TC002_BUSYBOX` and is not vendored, being GPLv2.
+
 Recovery still rests on the code self-heal (boot-fail counter → stock app,
 120 s no-network → stock app) and the reset-button reflash of the stock image
 from the UDISK; the no-op rehearsal proved that reflash mechanism works on
