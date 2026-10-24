@@ -12,11 +12,18 @@ two kinds of claim below, kept apart on purpose:
 
 ## opening it
 
-![the front diffuser being prised off at one end](photos/teardown/opening-front.webp)
+![the front display cover being prised off at one end](photos/teardown/opening-front.webp)
 
-the front is a **black diffuser** that prises off: it is clipped into the case, and lifting it at
-one end exposes a black **egg-crate louvre**, one cell per led, that keeps each pixel's light to
-its own square. the diffuser's inside face is printed **`Pixbar`**. one end of the case carries
+the way in is through the front, in two steps. this is the owner's account of opening this
+unit, not something read off the photographs:
+
+1. **the front display cover is glued on** with a film of double-sided tape, so it has to be
+   prised off rather than unclipped. the photograph shows it part-way off at one end.
+2. behind it is the **led diffuser panel**, a black egg-crate louvre with one cell per led that
+   keeps each pixel's light to its own square. **four screws at its bottom** hold it in. with
+   those out, the rest of the assembly pops out of the case.
+
+the cover's inside face is printed **`Pixbar`**. one end of the case carries
 the **1/4-inch tripod thread** (*spec*); the long face beside it (*the base, as the clock stands*)
 carries a grey window and the regulatory label:
 
@@ -27,8 +34,8 @@ carries a grey window and the regulatory label:
 | **`R 214-260250`** | beside the japanese giteki mark: the radio-equipment certification number |
 | **RoHS**, the crossed-out wheelie bin | the usual european marks |
 
-with the diffuser and the louvre off, the led panel lifts out of the front on its ribbons, and
-the rest of these photographs are of the tray behind it.
+once it is out, the led panel lifts away on its ribbons, and the rest of these photographs are
+of the tray behind it.
 
 ## the whole thing
 
@@ -84,9 +91,9 @@ reads the mic **level** from the mcu (`queryMicValue`), not from the soc's audio
 
 ## the led panel
 
-![the led panel from the front, diffuser removed](photos/teardown/led-panel.webp)
+![the led panel from the front, cover and diffuser panel removed](photos/teardown/led-panel.webp)
 
-the panel with the front diffuser and the louvre off: the **52 × 16 grid of rgb leds** on a white board, with
+the panel with the front cover and the diffuser panel off: the **52 × 16 grid of rgb leds** on a white board, with
 the led drivers on its back (visible in the first photo). see [`LED-SPI.md`](LED-SPI.md) for how
 it is driven.
 
