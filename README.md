@@ -110,7 +110,7 @@ docs, one topic each:
 | [`SCRIPTING.md`](SCRIPTING.md) | running berry scripts on the device: the `tc002` and `panel` api, events from the buttons, mqtt and ntfy, drawing and the sixty-frame-a-second stream, the script store, and what a script is not allowed to do |
 | [`SECURITY.md`](SECURITY.md) | every security observation in one place, with mitigations |
 | [`SETUP.md`](SETUP.md) | the setup-ap, discovery and adoption flow that replaces ulanzi studio |
-| [`TEARDOWN.md`](TEARDOWN.md) | inside the case, photographed: the boards and what is printed on them (the soc is an `SSD210`, there is a `GND RX TX` header beside it), the battery, the mic, speaker and antenna, and what each photo confirms of what the software found |
+| [`TEARDOWN.md`](TEARDOWN.md) | how the case opens and what it holds, photographed: the regulatory label (fcc id `2BTBM-TC002`), the boards and what is printed on them (the soc is an `SSD210`, there is a `GND RX TX` header beside it), the battery, the mic, speaker and antenna, and what each photo confirms of what the software found |
 
 tools:
 

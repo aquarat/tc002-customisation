@@ -1,8 +1,8 @@
 # TEARDOWN.md — inside a TC002, photographed
 
 everything else in these notes was read off a running unit: `/proc`, `/sys`, the device tree,
-strings in the app. this is the other half — what the case holds, photographed with the back
-off, on a unit whose firmware matches *unit B* in [`FINGERPRINTS.md`](FINGERPRINTS.md).
+strings in the app. this is the other half — what the case holds, opened from the front and
+photographed, on a unit whose firmware matches *unit B* in [`FINGERPRINTS.md`](FINGERPRINTS.md).
 
 two kinds of claim below, kept apart on purpose:
 
@@ -10,11 +10,31 @@ two kinds of claim below, kept apart on purpose:
 - *inferred* — what a part probably is, from where it sits and what the software already
   established. none of these were probed with a meter
 
+## opening it
+
+![the front diffuser being prised off at one end](photos/teardown/opening-front.webp)
+
+the front is a **black diffuser** that prises off: it is clipped into the case, and lifting it at
+one end exposes a black **egg-crate louvre**, one cell per led, that keeps each pixel's light to
+its own square. the diffuser's inside face is printed **`Pixbar`**. one end of the case carries
+the **1/4-inch tripod thread** (*spec*); the long face beside it (*the base, as the clock stands*)
+carries a grey window and the regulatory label:
+
+| on the label | |
+|---|---|
+| **`…D: 2BTBM-TC002`** | *the fcc id*: grantee `2BTBM`, product `TC002`. the start of the line is out of frame. an fcc filing is public and usually includes the manufacturer's own internal photographs |
+| **`…T ID: 26J44B0TM765`** | the start is out of frame; *probably the chinese cmiit id* |
+| **`R 214-260250`** | beside the japanese giteki mark: the radio-equipment certification number |
+| **RoHS**, the crossed-out wheelie bin | the usual european marks |
+
+with the diffuser and the louvre off, the led panel lifts out of the front on its ribbons, and
+the rest of these photographs are of the tray behind it.
+
 ## the whole thing
 
 ![the case open, the led panel lifted on its two ribbons](photos/teardown/inside-overview.webp)
 
-the led panel is the lid: it lifts away on **two grey ribbon cables** and everything else lives
+the led panel is the front of the tray: it lifts away on **two grey ribbon cables** and everything else lives
 in the tray behind it. from left to right as photographed: the soc end of the main board, the
 battery, the right-hand end of the main board with the panel, mic and speaker connectors, the
 speaker box and the flexible wi-fi antenna. the main board (**`Ulanzi_I008_MB_V2.0`**) runs along
@@ -66,7 +86,7 @@ reads the mic **level** from the mcu (`queryMicValue`), not from the soc's audio
 
 ![the led panel from the front, diffuser removed](photos/teardown/led-panel.webp)
 
-the panel with the front diffuser off: the **52 × 16 grid of rgb leds** on a white board, with
+the panel with the front diffuser and the louvre off: the **52 × 16 grid of rgb leds** on a white board, with
 the led drivers on its back (visible in the first photo). see [`LED-SPI.md`](LED-SPI.md) for how
 it is driven.
 
